@@ -1,12 +1,12 @@
 ALTER PROCEDURE [dbo].[sp_GetUserCompanyData]
-   @UserId   BIGINT,
+      @UserId   BIGINT,
     @EntityId BIGINT
 AS
 BEGIN
     SET NOCOUNT ON;
 
     -------------------------------------------------------------------------
-    -- 1) Verificar que el usuario exista y esté activo
+    -- 1) Validar que el usuario existe y está activo
     -------------------------------------------------------------------------
     IF NOT EXISTS (
         SELECT 1
@@ -20,21 +20,22 @@ BEGIN
     END;
 
     -------------------------------------------------------------------------
-    -- 2) CTE para tomar datos básicos del usuario (principalmente user_is_admin)
+    -- 2) Obtener los registros permitidos para el usuario en la entidad padre
     -------------------------------------------------------------------------
-    ;WITH UserBase AS (
-        SELECT
-            u.id_user,
-            u.user_is_admin
-        FROM [User] u
-        WHERE u.id_user = @UserId
+    ;WITH AccessibleRecords AS (
+        SELECT er.child_record_id
+        FROM UserCompany uc
+        INNER JOIN EntityRelationship er
+            ON uc.company_id = er.parent_record_id
+        WHERE uc.user_id = @UserId
+          AND uc.useco_active = 1
+          AND er.child_entity_id = @EntityId
     ),
+
     -------------------------------------------------------------------------
-    -- 3) CTE para recoger TODOS los permisos directos de ese usuario, 
-    --    en TODAS sus compañías activas, para la entidad solicitada.
-    --    Se incluyen sólo los que estén "peusr_include=1".
+    -- 3) Permisos directos a nivel de ENTIDAD (PermiUser)
     -------------------------------------------------------------------------
-    DirectPerms AS (
+    EntityPerms AS (
         SELECT 
             p.can_create,
             p.can_read,
@@ -42,55 +43,69 @@ BEGIN
             p.can_delete,
             p.can_import,
             p.can_export
-        FROM UserBase ub
-        INNER JOIN UserCompany uc
-            ON ub.id_user = uc.user_id
+        FROM UserCompany uc
         INNER JOIN PermiUser pu
             ON uc.id_useco = pu.usercompany_id
         INNER JOIN Permission p
             ON pu.permission_id = p.id_permi
-        WHERE uc.useco_active   = 1
-          AND pu.peusr_include  = 1
+        WHERE uc.user_id       = @UserId
+          AND uc.useco_active  = 1
+          AND pu.peusr_include = 1
           AND pu.entitycatalog_id = @EntityId
-    )
+    ),
+
     -------------------------------------------------------------------------
-    -- 4) SELECT final: 
-    --    - Muestra el nombre y descripción de la entidad (si lo deseas).
-    --    - Combina (MAX) los bits de permiso.
-    --    - Si user_is_admin=1 => todos los permisos = 1.
+    -- 4) Permisos heredados por ROLES a nivel de ENTIDAD (PermiRole)
+    -------------------------------------------------------------------------
+    RoleEntityPerms AS (
+        SELECT 
+            p.can_create,
+            p.can_read,
+            p.can_update,
+            p.can_delete,
+            p.can_import,
+            p.can_export
+        FROM UserRole ur
+        INNER JOIN PermiRole pr
+            ON ur.role_id = pr.role_id
+        INNER JOIN Permission p
+            ON pr.permission_id = p.id_permi
+        WHERE ur.user_id       = @UserId
+          AND pr.perol_include = 1
+          AND pr.entitycatalog_id = @EntityId
+    ),
+
+    -------------------------------------------------------------------------
+    -- 5) Combinar permisos de usuario directo y heredado por roles
+    -------------------------------------------------------------------------
+    AllPerms AS (
+        SELECT * FROM EntityPerms
+        UNION ALL
+        SELECT * FROM RoleEntityPerms
+    )
+
+    -------------------------------------------------------------------------
+    -- 6) SELECT final, unimos con EntityCatalog y filtramos por registros accesibles
     -------------------------------------------------------------------------
     SELECT 
-        EC.entit_name,
-        EC.entit_descrip,
+        ec.entit_name,
+        ec.entit_descrip,
 
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_create = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_create,
+        ISNULL(MAX(CASE WHEN can_create = 1 THEN 1 ELSE 0 END), 0) AS can_create,
+        ISNULL(MAX(CASE WHEN can_read   = 1 THEN 1 ELSE 0 END), 0) AS can_read,
+        ISNULL(MAX(CASE WHEN can_update = 1 THEN 1 ELSE 0 END), 0) AS can_update,
+        ISNULL(MAX(CASE WHEN can_delete = 1 THEN 1 ELSE 0 END), 0) AS can_delete,
+        ISNULL(MAX(CASE WHEN can_import = 1 THEN 1 ELSE 0 END), 0) AS can_import,
+        ISNULL(MAX(CASE WHEN can_export = 1 THEN 1 ELSE 0 END), 0) AS can_export
 
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_read = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_read,
-
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_update = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_update,
-
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_delete = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_delete,
-
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_import = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_import,
-
-        CASE WHEN (SELECT user_is_admin FROM UserBase) = 1 THEN 1
-             ELSE ISNULL(MAX(CASE WHEN can_export = 1 THEN 1 ELSE 0 END), 0)
-        END AS can_export
-
-    FROM DirectPerms
-    -- Unimos con EntityCatalog para mostrar info de la entidad
-    CROSS JOIN EntityCatalog EC
-    WHERE EC.id_entit = @EntityId
-    GROUP BY EC.entit_name, EC.entit_descrip;
+    FROM AllPerms
+    CROSS JOIN EntityCatalog ec
+    WHERE ec.id_entit = @EntityId
+      AND EXISTS (
+          SELECT 1
+          FROM AccessibleRecords ar
+          WHERE ar.child_record_id = ec.id_entit
+      )
+    GROUP BY ec.entit_name, ec.entit_descrip;
 END;
 GO
