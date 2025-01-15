@@ -20,20 +20,35 @@ BEGIN
     END;
 
     -------------------------------------------------------------------------
-    -- 2) Obtener los registros permitidos para el usuario en la entidad padre
+    -- 2) Obtener las sucursales a las que el usuario tiene acceso
     -------------------------------------------------------------------------
-    ;WITH AccessibleRecords AS (
-        SELECT er.child_record_id
+    ;WITH AccessibleBranches AS (
+        SELECT bo.id_broff, bo.broff_name, bo.broff_code, bo.broff_city, bo.broff_state, bo.broff_country
         FROM UserCompany uc
-        INNER JOIN EntityRelationship er
-            ON uc.company_id = er.parent_record_id
+        INNER JOIN BranchOffice bo
+            ON uc.company_id = bo.company_id
         WHERE uc.user_id = @UserId
           AND uc.useco_active = 1
-          AND er.child_entity_id = @EntityId
+          AND bo.broff_active = 1
     ),
 
     -------------------------------------------------------------------------
-    -- 3) Permisos directos a nivel de ENTIDAD (PermiUser)
+    -- 3) Obtener los centros de costos asociados a esas sucursales
+    -------------------------------------------------------------------------
+    AccessibleCostCenters AS (
+        SELECT cc.id_cosce, cc.cosce_code, cc.cosce_name, cc.cosce_description, cc.cosce_budget, ab.id_broff
+        FROM AccessibleBranches ab
+        INNER JOIN EntityRelationship er
+            ON ab.id_broff = er.parent_record_id
+        INNER JOIN CostCenter cc
+            ON er.child_record_id = cc.id_cosce
+        WHERE er.parent_entity_id = 2
+          AND er.child_entity_id = @EntityId
+          AND cc.cosce_active = 1
+    ),
+
+    -------------------------------------------------------------------------
+    -- 4) Permisos directos a nivel de ENTIDAD (PermiUser)
     -------------------------------------------------------------------------
     EntityPerms AS (
         SELECT 
@@ -42,20 +57,22 @@ BEGIN
             p.can_update,
             p.can_delete,
             p.can_import,
-            p.can_export
+            p.can_export,
+            cc.id_cosce
         FROM UserCompany uc
         INNER JOIN PermiUser pu
             ON uc.id_useco = pu.usercompany_id
         INNER JOIN Permission p
             ON pu.permission_id = p.id_permi
+        INNER JOIN AccessibleCostCenters cc
+            ON cc.id_cosce = pu.entitycatalog_id
         WHERE uc.user_id       = @UserId
           AND uc.useco_active  = 1
           AND pu.peusr_include = 1
-          AND pu.entitycatalog_id = @EntityId
     ),
 
     -------------------------------------------------------------------------
-    -- 4) Permisos heredados por ROLES a nivel de ENTIDAD (PermiRole)
+    -- 5) Permisos heredados por ROLES a nivel de ENTIDAD (PermiRole)
     -------------------------------------------------------------------------
     RoleEntityPerms AS (
         SELECT 
@@ -64,19 +81,21 @@ BEGIN
             p.can_update,
             p.can_delete,
             p.can_import,
-            p.can_export
+            p.can_export,
+            cc.id_cosce
         FROM UserRole ur
         INNER JOIN PermiRole pr
             ON ur.role_id = pr.role_id
         INNER JOIN Permission p
             ON pr.permission_id = p.id_permi
+        INNER JOIN AccessibleCostCenters cc
+            ON cc.id_cosce = pr.entitycatalog_id
         WHERE ur.user_id       = @UserId
           AND pr.perol_include = 1
-          AND pr.entitycatalog_id = @EntityId
     ),
 
     -------------------------------------------------------------------------
-    -- 5) Combinar permisos de usuario directo y heredado por roles
+    -- 6) Combinar permisos de usuario directo y heredado por roles
     -------------------------------------------------------------------------
     AllPerms AS (
         SELECT * FROM EntityPerms
@@ -85,27 +104,34 @@ BEGIN
     )
 
     -------------------------------------------------------------------------
-    -- 6) SELECT final, unimos con EntityCatalog y filtramos por registros accesibles
+    -- 7) SELECT final: Devolver la información de sucursales, centros de costos y permisos
     -------------------------------------------------------------------------
     SELECT 
-        ec.entit_name,
-        ec.entit_descrip,
+        ab.broff_name AS branch_name,
+        ab.broff_code AS branch_code,
+        ab.broff_city AS branch_city,
+        ab.broff_state AS branch_state,
+        ab.broff_country AS branch_country,
 
-        ISNULL(MAX(CASE WHEN can_create = 1 THEN 1 ELSE 0 END), 0) AS can_create,
-        ISNULL(MAX(CASE WHEN can_read   = 1 THEN 1 ELSE 0 END), 0) AS can_read,
-        ISNULL(MAX(CASE WHEN can_update = 1 THEN 1 ELSE 0 END), 0) AS can_update,
-        ISNULL(MAX(CASE WHEN can_delete = 1 THEN 1 ELSE 0 END), 0) AS can_delete,
-        ISNULL(MAX(CASE WHEN can_import = 1 THEN 1 ELSE 0 END), 0) AS can_import,
-        ISNULL(MAX(CASE WHEN can_export = 1 THEN 1 ELSE 0 END), 0) AS can_export
+        cc.cosce_code AS cost_center_code,
+        cc.cosce_name AS cost_center_name,
+        cc.cosce_description AS cost_center_description,
+        cc.cosce_budget AS cost_center_budget,
 
-    FROM AllPerms
-    CROSS JOIN EntityCatalog ec
-    WHERE ec.id_entit = @EntityId
-      AND EXISTS (
-          SELECT 1
-          FROM AccessibleRecords ar
-          WHERE ar.child_record_id = ec.id_entit
-      )
-    GROUP BY ec.entit_name, ec.entit_descrip;
+        ISNULL(MAX(CASE WHEN ap.can_create = 1 THEN 1 ELSE 0 END), 0) AS can_create,
+        ISNULL(MAX(CASE WHEN ap.can_read   = 1 THEN 1 ELSE 0 END), 0) AS can_read,
+        ISNULL(MAX(CASE WHEN ap.can_update = 1 THEN 1 ELSE 0 END), 0) AS can_update,
+        ISNULL(MAX(CASE WHEN ap.can_delete = 1 THEN 1 ELSE 0 END), 0) AS can_delete,
+        ISNULL(MAX(CASE WHEN ap.can_import = 1 THEN 1 ELSE 0 END), 0) AS can_import,
+        ISNULL(MAX(CASE WHEN ap.can_export = 1 THEN 1 ELSE 0 END), 0) AS can_export
+
+    FROM AllPerms ap
+    INNER JOIN AccessibleCostCenters cc
+        ON ap.id_cosce = cc.id_cosce
+    INNER JOIN AccessibleBranches ab
+        ON cc.id_broff = ab.id_broff
+    GROUP BY 
+        ab.broff_name, ab.broff_code, ab.broff_city, ab.broff_state, ab.broff_country,
+        cc.cosce_code, cc.cosce_name, cc.cosce_description, cc.cosce_budget;
 END;
 GO
